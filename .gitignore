@@ -1,0 +1,30 @@
+# macOS zip 解压垃圾
+__MACOSX/
+.DS_Store
+
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Node
+node_modules/
+
+# 构建产物
+dist/
+build/
+*.log
+
+# IDE
+.idea/
+*.swp
+*.swo
+
+/data/
+
