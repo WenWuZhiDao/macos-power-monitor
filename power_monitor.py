@@ -8,6 +8,7 @@ power_monitor.py — 轻量级 macOS 功率实时监控（三曲线 + 时间范�
   - 系统耗电 = BatteryData.SystemPower     (系统实时消耗功率, W)
   - 充电功率 = 电池电压 × 电流             (充入电池的功率, W; 负值=放电)
 关系约为：总功率 ≈ 系统耗电 + 充电功率（差值来自充电转换损耗与采样误差）。
+另外叠加一条电池电量(%)曲线，绘制在图表右侧的独立 0~100% 坐标轴上。
 
 数据追加写入 CSV(全量历史)，并通过内置的本地 HTTP 服务提供实时曲线页面，
 页面支持选择查看的时间范围：近一天/两天/三天/一周/自定义。
@@ -66,6 +67,7 @@ _t = []            # epoch 秒(升序)
 _charge = []       # 充电功率(W)，正=充入 负=放电
 _total = []        # 总功率/适配器输入(W)
 _system = []       # 系统耗电(W)
+_soc = []          # 电池电量(%)
 _latest = {}       # 最近一条样本
 _adapter = {}      # 电源适配器信息
 _battery_present = True
@@ -210,14 +212,15 @@ def preload_history():
                 ep = _num(p[1])
                 if ep is None or ep < cutoff:
                     continue
-                rows.append((ep, _num(p[2]), _num(p[3]), _num(p[4])))
+                soc = _num(p[7]) if len(p) > 7 else None
+                rows.append((ep, _num(p[2]), _num(p[3]), _num(p[4]), soc))
     except Exception:
         return
     rows.sort(key=lambda r: r[0])
     with _lock:
-        for ep, c, tot, sysw in rows:
+        for ep, c, tot, sysw, soc in rows:
             _t.append(ep); _charge.append(c)
-            _total.append(tot); _system.append(sysw)
+            _total.append(tot); _system.append(sysw); _soc.append(soc)
 
 
 def sampler_loop():
@@ -233,17 +236,18 @@ def sampler_loop():
                     _charge.append(s["charge"])
                     _total.append(s["total"])
                     _system.append(s["system"])
+                    _soc.append(s["soc"])
                     # 时间窗裁剪：丢弃早于 RETAIN_SECONDS 的样本
                     cutoff = s["t"] - RETAIN_SECONDS
                     idx = bisect.bisect_left(_t, cutoff)
                     if idx > 0:
                         del _t[:idx]; del _charge[:idx]
-                        del _total[:idx]; del _system[:idx]
+                        del _total[:idx]; del _system[:idx]; del _soc[:idx]
                     # 安全上限
                     if len(_t) > MAX_POINTS:
                         cut = len(_t) - MAX_POINTS
                         del _t[:cut]; del _charge[:cut]
-                        del _total[:cut]; del _system[:cut]
+                        del _total[:cut]; del _system[:cut]; del _soc[:cut]
                     _latest.clear()
                     _latest.update(s)
                     _adapter = s["adapter"]
@@ -293,12 +297,13 @@ def _slice_mem(t_from, t_to):
     """在持有 _lock 时调用；返回窗口内样本的拷贝。"""
     lo = bisect.bisect_left(_t, t_from)
     hi = bisect.bisect_right(_t, t_to)
-    return _t[lo:hi], _charge[lo:hi], _total[lo:hi], _system[lo:hi]
+    return (_t[lo:hi], _charge[lo:hi], _total[lo:hi],
+            _system[lo:hi], _soc[lo:hi])
 
 
 def _read_csv_window(t_from, t_to):
     """从 CSV 读取时间窗内的样本(用于早于内存窗口的自定义范围)。"""
-    T = []; C = []; TO = []; SY = []
+    T = []; C = []; TO = []; SY = []; SO = []
     try:
         with open(CSV_PATH) as f:
             f.readline()
@@ -311,25 +316,26 @@ def _read_csv_window(t_from, t_to):
                     continue
                 T.append(ep); C.append(_num(p[2]))
                 TO.append(_num(p[3])); SY.append(_num(p[4]))
+                SO.append(_num(p[7]) if len(p) > 7 else None)
     except FileNotFoundError:
         pass
-    return T, C, TO, SY
+    return T, C, TO, SY, SO
 
 
-def _downsample(t, c, tot, sysw, maxp):
+def _downsample(t, c, tot, sysw, soc, maxp):
     """按桶平均降采样到 <= maxp 个点；保留 None。"""
     n = len(t)
     if n <= maxp:
-        return t, c, tot, sysw
+        return t, c, tot, sysw, soc
     k = math.ceil(n / maxp)
-    T = []; C = []; TO = []; SY = []
+    T = []; C = []; TO = []; SY = []; SO = []
     for i in range(0, n, k):
         bt = t[i:i + k]
         T.append(sum(bt) / len(bt))
-        for src, dst in ((c, C), (tot, TO), (sysw, SY)):
+        for src, dst in ((c, C), (tot, TO), (sysw, SY), (soc, SO)):
             vals = [x for x in src[i:i + k] if x is not None]
             dst.append(sum(vals) / len(vals) if vals else None)
-    return T, C, TO, SY
+    return T, C, TO, SY, SO
 
 
 def _rnd(arr):
@@ -344,15 +350,15 @@ def build_payload(qs):
         adapter = dict(_adapter)
         bp = _battery_present
         if earliest is not None and t_from >= earliest:
-            t, c, tot, sysw = _slice_mem(t_from, t_to)
+            t, c, tot, sysw, soc = _slice_mem(t_from, t_to)
             need_csv = False
         else:
-            t = c = tot = sysw = None
+            t = c = tot = sysw = soc = None
             need_csv = True
     if need_csv:
-        t, c, tot, sysw = _read_csv_window(t_from, t_to)
+        t, c, tot, sysw, soc = _read_csv_window(t_from, t_to)
     raw = len(t)
-    t, c, tot, sysw = _downsample(t, c, tot, sysw, PLOT_POINTS)
+    t, c, tot, sysw, soc = _downsample(t, c, tot, sysw, soc, PLOT_POINTS)
     return {
         "interval": INTERVAL,
         "battery_present": bp,
@@ -362,6 +368,7 @@ def build_payload(qs):
         "charge": _rnd(c),
         "total": _rnd(tot),
         "system": _rnd(sysw),
+        "soc": _rnd(soc),
         "latest": latest,
         "adapter": adapter,
     }
@@ -427,6 +434,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="lbl">充电功率 · 入电池</div>
     <div class="val" id="v-charge" style="color:#3fb950">--</div>
   </div>
+  <div class="card" style="border-left-color:#bc8cff">
+    <div class="lbl">电池电量</div>
+    <div class="val" id="v-soc" style="color:#bc8cff">--</div>
+  </div>
 </div>
 <div class="stats">
   <div>电压 <b id="volt">--</b></div>
@@ -457,12 +468,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 const $ = id => document.getElementById(id);
 let interval = 5000;
 let sel = { mode:'preset', days:1 };           // 当前选中的时间范围
-let cache = { t:[], total:[], system:[], charge:[] };   // 最近一次返回的数据(供悬浮/重绘)
+let cache = { t:[], total:[], system:[], charge:[], soc:[] };   // 最近一次返回的数据(供悬浮/重绘)
 let hoverX = null, hoverCX = 0, hoverCY = 0, rafPending = false;  // 鼠标悬浮状态
 const SERIES = [
   { key:'total',  name:'总功率',   color:'#58a6ff' },
   { key:'system', name:'系统耗电', color:'#e3b341' },
   { key:'charge', name:'充电功率', color:'#3fb950' },
+  { key:'soc',    name:'电池电量', color:'#bc8cff', axis:'right', pct:true },
 ];
 const pad = n => String(n).padStart(2,'0');
 
@@ -501,7 +513,8 @@ function showTip(ep, data, idx){
   let html='<div class="tt-time">'+ts+'</div>';
   for(const s of SERIES){
     const v=(data[s.key]||[])[idx];
-    const val=(v==null)?'--':((s.key==='charge'&&v>=0?'+':'')+v.toFixed(1)+' W');
+    let val='--';
+    if(v!=null) val = s.pct ? (v.toFixed(1)+' %') : ((s.key==='charge'&&v>=0?'+':'')+v.toFixed(1)+' W');
     html+='<div class="tt-row"><span class="tt-dot" style="background:'+s.color+'"></span>'+s.name+'<b>'+val+'</b></div>';
   }
   tip.innerHTML=html; tip.style.display='block';
@@ -518,20 +531,23 @@ function draw(t, data){
   cv.width=Math.round(cssW*dpr); cv.height=Math.round(cssH*dpr);
   const ctx=cv.getContext('2d'); ctx.setTransform(dpr,0,0,dpr,0,0);
   ctx.clearRect(0,0,cssW,cssH);
-  const mL=58,mR=18,mT=14,mB=30, pW=cssW-mL-mR, pH=cssH-mT-mB;
+  const mL=58,mR=46,mT=14,mB=30, pW=cssW-mL-mR, pH=cssH-mT-mB;
   if(!t.length){ $('tip').style.display='none'; ctx.fillStyle='#6b7785'; ctx.font='13px sans-serif'; ctx.fillText('暂无数据',mL,mT+20); return; }
   let wmin=0, wmax=1;
-  for(const s of SERIES){ const arr=data[s.key]||[]; for(let i=0;i<arr.length;i++){ const v=arr[i]; if(v==null)continue; if(v<wmin)wmin=v; if(v>wmax)wmax=v; } }
+  for(const s of SERIES){ if(s.axis==='right') continue; const arr=data[s.key]||[]; for(let i=0;i<arr.length;i++){ const v=arr[i]; if(v==null)continue; if(v<wmin)wmin=v; if(v>wmax)wmax=v; } }
   wmax += (wmax-wmin)*0.1;
   if(wmin<0) wmin -= (wmax-wmin)*0.05;
   const tmin=t[0], tmax=(t[t.length-1]>tmin)?t[t.length-1]:tmin+1, span=tmax-tmin;
   const X=v=> mL+(v-tmin)/(tmax-tmin)*pW;
   const Y=v=> mT+(1-(v-wmin)/(wmax-wmin))*pH;
+  const YR=v=> mT+(1-v/100)*pH;                    // 右轴：电量 0~100%
+  const Ykey=s=> (s.axis==='right'? YR : Y);
   ctx.font='11px -apple-system,sans-serif'; ctx.lineWidth=1; ctx.textBaseline='middle';
   for(let i=0;i<=5;i++){
     const val=wmin+(wmax-wmin)*i/5, y=Y(val);
     ctx.strokeStyle='#1c2128'; ctx.beginPath(); ctx.moveTo(mL,y); ctx.lineTo(mL+pW,y); ctx.stroke();
     ctx.fillStyle='#6b7785'; ctx.textAlign='right'; ctx.fillText(val.toFixed(1)+'W', mL-8, y);
+    ctx.fillStyle='#bc8cff'; ctx.textAlign='left'; ctx.fillText(Math.round(100*i/5)+'%', mL+pW+8, y);
   }
   if(wmin<0){ const y0=Y(0); ctx.strokeStyle='#30363d'; ctx.beginPath(); ctx.moveTo(mL,y0); ctx.lineTo(mL+pW,y0); ctx.stroke(); }
   ctx.fillStyle='#6b7785'; ctx.textAlign='center'; ctx.textBaseline='top';
@@ -541,16 +557,16 @@ function draw(t, data){
     ctx.fillText(fmtTick(t[idx],span), x, mT+pH+8);
   }
   for(const s of SERIES){
-    const arr=data[s.key]||[];
+    const arr=data[s.key]||[], Yf=Ykey(s);
     ctx.beginPath(); let started=false;
     for(let i=0;i<t.length;i++){
       const v=arr[i];
       if(v==null){ started=false; continue; }
-      const x=X(t[i]), y=Y(v);
+      const x=X(t[i]), y=Yf(v);
       if(started) ctx.lineTo(x,y); else { ctx.moveTo(x,y); started=true; }
     }
     ctx.strokeStyle=s.color; ctx.lineWidth=2; ctx.stroke();
-    for(let i=t.length-1;i>=0;i--){ if(arr[i]!=null){ ctx.fillStyle=s.color; ctx.beginPath(); ctx.arc(X(t[i]),Y(arr[i]),3,0,Math.PI*2); ctx.fill(); break; } }
+    for(let i=t.length-1;i>=0;i--){ if(arr[i]!=null){ ctx.fillStyle=s.color; ctx.beginPath(); ctx.arc(X(t[i]),Yf(arr[i]),3,0,Math.PI*2); ctx.fill(); break; } }
   }
   // 鼠标悬浮：竖直参考线 + 高亮点 + 数值提示
   if(hoverX!=null){
@@ -562,7 +578,7 @@ function draw(t, data){
       ctx.beginPath(); ctx.moveTo(px,mT); ctx.lineTo(px,mT+pH); ctx.stroke();
       for(const s of SERIES){
         const v=(data[s.key]||[])[idx]; if(v==null) continue;
-        const py=Y(v);
+        const py=Ykey(s)(v);
         ctx.fillStyle=s.color; ctx.beginPath(); ctx.arc(px,py,4,0,Math.PI*2); ctx.fill();
         ctx.strokeStyle='#0e1116'; ctx.lineWidth=2; ctx.beginPath(); ctx.arc(px,py,4,0,Math.PI*2); ctx.stroke();
       }
@@ -592,6 +608,7 @@ async function tick(){
     $('v-total').textContent=fmtW(L.total,false);
     $('v-system').textContent=fmtW(L.system,false);
     $('v-charge').textContent=fmtW(L.charge,true);
+    $('v-soc').textContent=L.soc!=null?L.soc.toFixed(1)+' %':'--';
     $('volt').textContent=L.v!=null?L.v.toFixed(2)+' V':'--';
     $('amp').textContent=L.a!=null?L.a.toFixed(2)+' A':'--';
     $('soc').textContent=L.soc!=null?Math.round(L.soc)+' %':'--';
@@ -603,7 +620,7 @@ async function tick(){
     if(L.charging){ st.textContent='充电中'; st.style.background='#1f6f33'; st.style.color='#d7ffe0'; }
     else if(L.external){ st.textContent=(L.soc!=null&&L.soc>=99)?'已充满':'已连接·未充电'; st.style.background='#3a3f46'; st.style.color='#e6edf3'; }
     else { st.textContent='使用电池'; st.style.background='#7a4318'; st.style.color='#ffe2c2'; }
-    cache={ t:d.t||[], total:d.total||[], system:d.system||[], charge:d.charge||[] };
+    cache={ t:d.t||[], total:d.total||[], system:d.system||[], charge:d.charge||[], soc:d.soc||[] };
     draw(cache.t, cache);
     $('msg').textContent = np===0 ? '所选时间范围内暂无数据。' : '';
   }catch(e){ $('msg').textContent='读取失败：'+e; }
