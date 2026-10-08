@@ -25,8 +25,8 @@ cd ./macos-power-monitor
 
 | 曲线 | 颜色 | 含义 | 数据来源 |
 | ---- | ---- | ---- | -------- |
-| **总功率** | 蓝 | 适配器输入的总功率（从墙插进来的电） | `BatteryData.AdapterPower` |
-| **系统实时耗电** | 黄 | 系统当前消耗的功率（CPU/屏幕/外设等） | `BatteryData.SystemPower` |
+| **总功率** | 蓝 | 适配器输入到电脑的总功率（不含适配器自身损耗） | `BatteryData.AdapterPower`，缺失时使用 `PowerTelemetryData.SystemPowerIn / 1000` |
+| **系统实时耗电** | 黄 | 系统当前消耗的功率（CPU/屏幕/外设等） | `BatteryData.SystemPower`，缺失时使用 `PowerTelemetryData.SystemLoad / 1000` |
 | **充电功率** | 绿 | 充入电池的功率（负值=放电） | 电池 `电压 × 电流` |
 
 三者满足能量守恒：**总功率 ≈ 系统耗电 + 充电功率**
@@ -37,7 +37,7 @@ cd ./macos-power-monitor
 - **插电但已充满**：总功率 ≈ 系统耗电，充电功率 ≈ 0。
 - **未插电**：总功率 ≈ 0，系统耗电由电池供给，充电功率为负（放电）。
 
-> 注：总功率/系统耗电字段来自 Apple Silicon 的 `BatteryData`。若在某些机型上读不到，
+> 注：兼容 macOS 27 的 `PowerTelemetryData`（瞬时功率单位为 mW，转换为 W），并保留旧版 `BatteryData` 字段支持。若在某些机型上读不到，
 > 对应曲线会自动留空，充电功率曲线仍可用。
 
 ## 看什么
@@ -91,7 +91,8 @@ PM_INTERVAL=2 PM_PORT=9000 ./start.sh
 
 - 采样线程每 `PM_INTERVAL` 秒执行 `ioreg -arc AppleSmartBattery`，解析出
   `Voltage`/`Amperage`（电池端，算充电功率）以及 `BatteryData` 中的
-  `AdapterPower`（总功率）、`SystemPower`（系统耗电），写入 CSV 并存入内存。
+  `AdapterPower`（总功率）、`SystemPower`（系统耗电）；旧字段缺失时读取
+  `PowerTelemetryData.SystemPowerIn` / `SystemLoad` 并将 mW 转为 W，写入 CSV 并存入内存。
 - 启动时从 CSV 预加载最近约一周的数据；`/data.json?range=...` 或 `?from=&to=`
   按时间窗切片后降采样返回。
 - HTTP 服务对外提供 `/`（曲线页面）与 `/data.json`（数据），

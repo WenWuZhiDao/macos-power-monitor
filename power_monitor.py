@@ -4,8 +4,8 @@
 power_monitor.py — 轻量级 macOS 功率实时监控（三曲线 + 时间范围选择）
 
 周期性调用 `ioreg` 读取电池遥测，绘制三条实时功率曲线：
-  - 总功率   = BatteryData.AdapterPower   (适配器输入的总功率, W)
-  - 系统耗电 = BatteryData.SystemPower     (系统实时消耗功率, W)
+  - 总功率   = BatteryData.AdapterPower 或 PowerTelemetryData.SystemPowerIn / 1000
+  - 系统耗电 = BatteryData.SystemPower 或 PowerTelemetryData.SystemLoad / 1000
   - 充电功率 = 电池电压 × 电流             (充入电池的功率, W; 负值=放电)
 关系约为：总功率 ≈ 系统耗电 + 充电功率（差值来自充电转换损耗与采样误差）。
 另外叠加一条电池电量(%)曲线，绘制在图表右侧的独立 0~100% 坐标轴上。
@@ -133,12 +133,21 @@ def sample_once():
     charging = bool(info.get("IsCharging", False))
     external = bool(info.get("ExternalConnected", False))
 
-    # 总功率 / 系统耗电：Apple Silicon 在 BatteryData 中以瓦(浮点)直接提供
+    # 旧字段以 W 提供；macOS 27 本机仅提供 PowerTelemetryData 的瞬时 mW 字段。
     bd = info.get("BatteryData") or {}
     total = bd.get("AdapterPower")
     system = bd.get("SystemPower")
     total = float(total) if isinstance(total, (int, float)) else None
     system = float(system) if isinstance(system, (int, float)) else None
+    telemetry = info.get("PowerTelemetryData") or {}
+    if total is None:
+        value = telemetry.get("SystemPowerIn")
+        if isinstance(value, (int, float)):
+            total = value / 1000.0
+    if system is None:
+        value = telemetry.get("SystemLoad")
+        if isinstance(value, (int, float)):
+            system = value / 1000.0
     if total is None and not external:
         total = 0.0
     if system is None and not external and charge < 0:
